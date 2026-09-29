@@ -772,9 +772,10 @@ class CsmForConditionalGeneration(CsmPreTrainedModel, CsmGenerationMixin):
         # `get_expanded_tied_weights_keys` gates on that flag, which would silently drop CSM's
         # *structural* tie between the backbone audio embeddings and the depth decoder embeddings,
         # leaving the backbone audio embeddings randomly initialized after `from_pretrained`.
-        # CSM's mapping is already fully expanded, so return it directly.
+        # CSM's mapping is already fully expanded, so return it directly when codebook
+        # embeddings are configured to be tied.
         if not all_submodels:
-            return dict(self._tied_weights_keys or {})
+            return dict(self._tied_weights_keys or {}) if self.config.tie_codebooks_embeddings else {}
         return super().get_expanded_tied_weights_keys(all_submodels=True)
 
     @classmethod
