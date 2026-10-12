@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ from ...generation import (
 from ...generation.logits_process import LogitsProcessorList
 from ...generation.stopping_criteria import MaxLengthCriteria, StoppingCriteriaList
 from ...generation.utils import GenerateNonBeamOutput
+from ...generation.xpu_graphs import XPUGraphCapturedForward
 from ...utils import logging
 
 
@@ -143,6 +144,27 @@ class CsmGenerationMixin(GenerationMixin):
 
         return generation_config, model_kwargs
 
+    def _get_xpu_graph_forward(self: "CsmForConditionalGeneration", model_kwargs: dict[str, Any]) -> Callable:
+        """XPU-graph capture for CSM's two sub-models.
+
+        CSM generates autoregressively over audio frames with two cooperating models: the `backbone`
+        predicts the first codebook token per frame, then the `depth_decoder` autoregressively fills
+        the remaining codebooks for that frame. Both per-step calls are captured into XPU graphs so
+        the whole decode is replayed without per-step host overhead.
+        """
+        if self.device.type != "xpu":
+            raise ValueError("`xpu_graphs=True` requires the model to be on an XPU device.")
+        if not hasattr(self, "_xpu_graph_pool"):
+            self._xpu_graph_pool = torch.xpu.graph_pool_handle()
+        pool = self._xpu_graph_pool
+        # Capture the depth decoder's own generate-time forward (it is invoked via .generate()).
+        if not isinstance(self.depth_decoder.forward, XPUGraphCapturedForward):
+            self.depth_decoder.forward = XPUGraphCapturedForward(
+                self.depth_decoder.forward, "CsmDepthDecoder", pool=pool
+            )
+        # The backbone is called directly (not via .generate()), so return a wrapper for it.
+        return XPUGraphCapturedForward(self.backbone_model.forward, "CsmBackbone", pool=pool)
+
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -199,11 +221,21 @@ class CsmGenerationMixin(GenerationMixin):
                     criterion.max_length -= cur_len
         # ============================================
 
-        model_forward = (
-            self.get_compiled_call(generation_config.compile_config)
-            if self._valid_auto_compile_criteria(model_kwargs, generation_config)
-            else self.__call__
-        )
+        if generation_config.xpu_graphs:
+            # XPU graph capture path: manual torch.xpu.graphs decode-step capture for both CSM
+            # sub-models. Mutually exclusive with torch.compile, requires a static cache.
+            if self._valid_auto_compile_criteria(model_kwargs, generation_config):
+                logger.warning_once(
+                    "Both `xpu_graphs` and auto-compile are enabled; `xpu_graphs` takes precedence "
+                    "and torch.compile is disabled for this generation."
+                )
+            model_forward = self._get_xpu_graph_forward(model_kwargs)
+        else:
+            model_forward = (
+                self.get_compiled_call(generation_config.compile_config)
+                if self._valid_auto_compile_criteria(model_kwargs, generation_config)
+                else self.__call__
+            )
 
         # *************** Csm specific ***************
         model_kwargs.update({"output_hidden_states": True})

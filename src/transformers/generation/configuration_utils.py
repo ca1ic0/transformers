@@ -182,6 +182,12 @@ class GenerationConfig(PushToHubMixin):
             largest call you expect so that repeated `generate()` calls with a longer prompt or a larger
             `max_new_tokens` (up to this ceiling) reuse the same cache instead of triggering a reallocation and a
             `torch.compile` recompilation.
+        xpu_graphs (`bool`, *optional*, defaults to `False`):
+            If `True`, decode steps are captured into XPU graphs via `torch.xpu.graphs` (the CUDA Graphs
+            equivalent on Intel XPU). Requires `cache_implementation="static"` and a model whose decode `forward`
+            has no host-side data-dependent control flow. On XPU, `torch.compile(mode="reduce-overhead")`
+            silently skips graph capture (a CUDA-centric gate), so this explicit flag is the supported way to get
+            CUDA-Graphs-style whole-decode-step capture. Currently supported on a subset of models (e.g. CSM).
 
         > Parameters for manipulation of the model output logits
 
@@ -411,6 +417,7 @@ class GenerationConfig(PushToHubMixin):
         self.cache_implementation = kwargs.pop("cache_implementation", None)
         self.cache_config = kwargs.pop("cache_config", None)
         self.max_cache_len = kwargs.pop("max_cache_len", None)
+        self.xpu_graphs = kwargs.pop("xpu_graphs", None)
 
         # Parameters for manipulation of the model output logits
         self.temperature = kwargs.pop("temperature", None)

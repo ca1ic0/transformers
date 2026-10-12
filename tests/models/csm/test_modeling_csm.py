@@ -14,6 +14,7 @@
 """Testing suite for the PyTorch ConversationalSpeechModel model."""
 
 import copy
+import tempfile
 import unittest
 
 import pytest
@@ -275,6 +276,69 @@ class CsmForConditionalGenerationTest(ModelTesterMixin, GenerationTesterMixin, u
     @unittest.skip(reason="CSM has special embeddings that can never be tied")
     def test_tied_weights_keys(self):
         pass
+
+    def test_audio_embeddings_tied_after_from_pretrained(self):
+        """Regression test: `CsmConfig` force-disables `tie_word_embeddings`, but the backbone audio
+        embeddings are *structurally* tied to the depth decoder embeddings and must survive
+        `from_pretrained`. Before the fix, the core `get_expanded_tied_weights_keys` gated on the
+        force-disabled flag and silently dropped this mapping, leaving the backbone audio embeddings
+        randomly initialized."""
+        config, _ = self.model_tester.prepare_config_and_inputs()
+        model = CsmForConditionalGeneration(config)
+        # Randomize the backbone audio embeddings to simulate a checkpoint whose depth decoder
+        # embeddings differ; after from_pretrained the tie must restore them to equality.
+        with torch.no_grad():
+            model.backbone_model.embed_tokens.embed_audio_tokens.weight.add_(torch.randn_like(
+                model.backbone_model.embed_tokens.embed_audio_tokens.weight
+            ))
+        self.assertFalse(
+            torch.equal(
+                model.backbone_model.embed_tokens.embed_audio_tokens.weight,
+                model.depth_decoder.model.embed_tokens.weight,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            loaded = CsmForConditionalGeneration.from_pretrained(tmp_dir)
+        self.assertTrue(
+            torch.equal(
+                loaded.backbone_model.embed_tokens.embed_audio_tokens.weight,
+                loaded.depth_decoder.model.embed_tokens.weight,
+            )
+        )
+
+    def test_xpu_graphs_generation_config_field(self):
+        """`xpu_graphs` is a valid GenerationConfig field and round-trips through save/load."""
+        from transformers import GenerationConfig
+
+        gc = GenerationConfig(xpu_graphs=True, cache_implementation="static")
+        self.assertTrue(gc.xpu_graphs)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gc.save_pretrained(tmp_dir)
+            loaded = GenerationConfig.from_pretrained(tmp_dir)
+        self.assertTrue(loaded.xpu_graphs)
+        self.assertEqual(loaded.cache_implementation, "static")
+
+    def test_xpu_graphs_wrapper_smoke(self):
+        """The XPUGraphCapturedForward wrapper preserves the wrapped callable's signature (for HF
+        generate kwargs validation) and passes through to eager when XPU graph capture is
+        unavailable or fails."""
+        from transformers.generation.xpu_graphs import XPUGraphCapturedForward
+
+        class _Sub(nn.Module):
+            def forward(self, input_ids, past_key_values=None):
+                return input_ids.sum()
+
+        sub = _Sub()
+        wrapped = XPUGraphCapturedForward(sub.forward, "smoke")
+        self.assertTrue(callable(wrapped))
+        # Signature preserved (functools.update_wrapper) so generate's kwargs validation works.
+        import inspect
+
+        self.assertIn("past_key_values", inspect.signature(wrapped).parameters)
+        # On a non-XPU device (or if capture fails) it must fall back to eager without raising.
+        out = wrapped(torch.ones(2, 3))
+        self.assertEqual(out, 6.0)
 
     @unittest.skip(reason="CSM has no separate base model without a head.")
     def test_model_base_model_prefix(self):

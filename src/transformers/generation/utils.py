@@ -78,6 +78,7 @@ from .configuration_utils import (
     GenerationMode,
 )
 from .continuous_batching import ContinuousMixin
+from .xpu_graphs import XPUGraphCapturedForward
 from .logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
@@ -2093,6 +2094,10 @@ class GenerationMixin(ContinuousMixin):
         # Finally, if there are any kwargs, update config with it -> highest priority at the end
         model_kwargs = generation_config.update(**kwargs)
 
+        # `xpu_graphs` is a GenerationConfig-only flag; it is consumed by the sampling loop and must
+        # not be forwarded to the model's forward (which does not accept it).
+        model_kwargs.pop("xpu_graphs", None)
+
         # Related to #40039: prior to this PR, models with sliding window attention were forced to have
         # `cache_implementation="hybrid"` (the static sliding window cache). For these models, we now want to use
         # the dynamic sliding window cache by default, so we UNSET `cache_implementation` if it is a default value.
@@ -2480,6 +2485,29 @@ class GenerationMixin(ContinuousMixin):
                     generation_config.compile_config.fullgraph = False
 
         return can_compile
+
+    def _get_xpu_graph_forward(self: "GenerativePreTrainedModel", model_kwargs: dict[str, Any]) -> Callable:
+        """Return a decode-step callable that captures into XPU graphs.
+
+        Used when `generation_config.xpu_graphs` is enabled. Manual `torch.xpu.graphs` capture is the
+        only way to get CUDA-Graphs-style whole-decode-step capture on Intel XPU, because inductor's
+        `mode="reduce-overhead"` silently skips capture on XPU (a CUDA-centric gate). This wraps the
+        model's bound `forward` with `XPUGraphCapturedForward`, keyed per decode position; host-read
+        scalars are baked into the captured kernels, so one graph per position is captured lazily on
+        first use.
+        """
+        if self.device.type != "xpu":
+            raise ValueError("`xpu_graphs=True` requires the model to be on an XPU device.")
+        cache = model_kwargs.get("past_key_values", model_kwargs.get("cache_params"))
+        if cache is None or not getattr(cache, "is_compileable", False):
+            raise ValueError(
+                "`xpu_graphs=True` requires a static (compileable) cache. Set `cache_implementation='static'`."
+            )
+        if getattr(self, "hf_quantizer", None) is not None and not self.hf_quantizer.is_compileable:
+            raise ValueError("`xpu_graphs=True` is not compatible with the model's quantization method.")
+        if not hasattr(self, "_xpu_graph_pool"):
+            self._xpu_graph_pool = torch.xpu.graph_pool_handle()
+        return XPUGraphCapturedForward(self.__call__, self.__class__.__name__, pool=self._xpu_graph_pool)
 
     @contextmanager
     def _optimize_model_for_decode(self: "GenerativePreTrainedModel"):
@@ -3176,11 +3204,21 @@ class GenerationMixin(ContinuousMixin):
         if pad_token_id is not None:
             pad_token_id = pad_token_id.to(input_ids.device)
 
-        model_forward = (
-            self.get_compiled_call(generation_config.compile_config)
-            if self._valid_auto_compile_criteria(model_kwargs, generation_config)
-            else self.__call__
-        )
+        if generation_config.xpu_graphs:
+            # XPU graph capture path: manual torch.xpu.graphs decode-step capture. Mutually exclusive
+            # with torch.compile (same as CUDA cudagraphs), and requires a static cache.
+            if self._valid_auto_compile_criteria(model_kwargs, generation_config):
+                logger.warning_once(
+                    "Both `xpu_graphs` and auto-compile are enabled; `xpu_graphs` takes precedence "
+                    "and torch.compile is disabled for this generation."
+                )
+            model_forward = self._get_xpu_graph_forward(model_kwargs)
+        else:
+            model_forward = (
+                self.get_compiled_call(generation_config.compile_config)
+                if self._valid_auto_compile_criteria(model_kwargs, generation_config)
+                else self.__call__
+            )
 
         prefill_consumed = False
         outputs = self._prefill(

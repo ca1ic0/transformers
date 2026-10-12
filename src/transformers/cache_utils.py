@@ -504,8 +504,29 @@ class StaticLayer(CacheLayerMixin):
         kv_length = self.max_cache_len
         return kv_length, kv_offset
 
+    def xpu_graph_enable(self) -> None:
+        """Make the layer XPU-graph capturable: CPU counter + unconditional int `get_seq_length`.
+
+        Two capture-hostile consumers read the position counter as a bound: `torch.arange(
+        past_seen_tokens, ...)` (a GPU tensor bound forces a D2H sync, L0 error 44 during
+        `torch.xpu.graph` capture) and `masking_utils` `q_offset.to(device)` (a CPU tensor bound is
+        an H2D copy, also L0 error 44). Keeping the counter on CPU and returning a plain python `int`
+        makes both paths host-reads (capture-safe). The in-place `add_` then runs on the CPU tensor
+        (a host op that is *not* recorded), so the XPU-graph wrapper advances the counter itself on
+        every replay. A cache whose prefill was served by a graph *replay* is never
+        lazy-initialized, so the `is_initialized` gate would wrongly report 0; the wrapper keeps the
+        counter truthful, hence we do not gate once enabled.
+        """
+        cl = getattr(self, "cumulative_length", None)
+        if torch.is_tensor(cl) and cl.device.type != "cpu":
+            self.cumulative_length = cl.cpu()
+        self._xpu_graph_enabled = True
+
     def get_seq_length(self) -> int:
         """Returns the sequence length of the cached states."""
+        if getattr(self, "_xpu_graph_enabled", False):
+            cl = getattr(self, "cumulative_length", None)
+            return int(cl) if torch.is_tensor(cl) else 0
         return self.cumulative_length if self.is_initialized else 0
 
     def get_max_length(self) -> int:
