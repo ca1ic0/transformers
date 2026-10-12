@@ -451,7 +451,14 @@ class StaticLayer(CacheLayerMixin):
             dtype=self.dtype,
             device=self.device,
         )
-        self.cumulative_length = self.cumulative_length.to(self.device)
+        # XPU-graph capture-safe mode keeps the counter on CPU: `update()` builds `cache_position`
+        # on the device from this 0-dim host tensor (a host-read, capture-safe), and the in-place
+        # `add_` is a host op that the capture wrapper replays explicitly. Moving the counter to
+        # the device here would be an H2D copy inside the capture region and fail with L0 error 44.
+        if getattr(self, "_xpu_graph_enabled", False):
+            self.cumulative_length = self.cumulative_length.to("cpu")
+        else:
+            self.cumulative_length = self.cumulative_length.to(self.device)
         # Note: `mark_static_address` is used to tag the tensors as a fixed data pointer, preventing compiled graph
         # breaks or cudagraph skips due to inplace mutations when updating the cache. However, it is not supported when
         # tracing the graph, so we skip it in this case. As prefill should never be compiled, this is not an issue and it

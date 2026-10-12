@@ -105,6 +105,24 @@ class CsmGenerationMixin(GenerationMixin):
 
         # initialize the generation config
         generation_config, model_kwargs = super()._prepare_generation_config(generation_config, **kwargs)
+
+        # XPU graph capture is mutually exclusive with torch.compile (inductor would trace into the
+        # capture wrapper and defeat manual capture). Force-disable auto-compile at both the outer
+        # and the depth decoder's generation-config levels.
+        if getattr(generation_config, "xpu_graphs", False):
+            generation_config.disable_compile = True
+            depth_decoder_kwargs["disable_compile"] = True
+            # The depth cache is allocated once and reused across frames (see `_sample`), so it is
+            # passed via `past_key_values` — which `generate` forbids combining with
+            # `cache_implementation`.
+            depth_decoder_kwargs["cache_implementation"] = None
+            # The depth decoder's capture is installed manually by `_get_xpu_graph_forward` on the
+            # inner model only — that is where the per-step cost is. The base per-step wrapper
+            # around the depth `ForCausalLM.__call__` (this flag) would additionally capture the
+            # codebooks head at a large one-time cost with no measurable steady-state gain, so it
+            # is force-disabled here and the flag is consumed, not propagated.
+            depth_decoder_kwargs["xpu_graphs"] = False
+
         self.depth_decoder.generation_config.update(**depth_decoder_kwargs)
 
         # ensure the depth decoder generation config is valid
@@ -145,25 +163,52 @@ class CsmGenerationMixin(GenerationMixin):
         return generation_config, model_kwargs
 
     def _get_xpu_graph_forward(self: "CsmForConditionalGeneration", model_kwargs: dict[str, Any]) -> Callable:
-        """XPU-graph capture for CSM's two sub-models.
+        """XPU-graph capture for CSM's depth decoder.
 
-        CSM generates autoregressively over audio frames with two cooperating models: the `backbone`
-        predicts the first codebook token per frame, then the `depth_decoder` autoregressively fills
-        the remaining codebooks for that frame. Both per-step calls are captured into XPU graphs so
-        the whole decode is replayed without per-step host overhead.
+        CSM generates autoregressively over audio frames: the `backbone` predicts the first codebook
+        token per frame, then the `depth_decoder` autoregressively fills the remaining codebooks. The
+        depth decoder dominates the per-frame cost (31 decode steps vs 1 for the backbone), so we
+        capture it into XPU graphs; the backbone's per-step `forward` returns an internal
+        `BaseModelOutputWithPast` (not logits) and is left eager to keep the decode contract intact.
+
+        Only the *inner* `CsmDepthDecoderModel` is wrapped — not the `CsmDepthDecoderForCausalLM` shell
+        that owns `.generate()` (its forward internally calls the inner model; wrapping both would
+        double-capture and recurse during warmup).
         """
         if self.device.type != "xpu":
             raise ValueError("`xpu_graphs=True` requires the model to be on an XPU device.")
-        if not hasattr(self, "_xpu_graph_pool"):
-            self._xpu_graph_pool = torch.xpu.graph_pool_handle()
-        pool = self._xpu_graph_pool
-        # Capture the depth decoder's own generate-time forward (it is invoked via .generate()).
-        if not isinstance(self.depth_decoder.forward, XPUGraphCapturedForward):
-            self.depth_decoder.forward = XPUGraphCapturedForward(
-                self.depth_decoder.forward, "CsmDepthDecoder", pool=pool
+        cache = model_kwargs.get("past_key_values", model_kwargs.get("cache_params"))
+        if cache is None or not getattr(cache, "is_compileable", False):
+            raise ValueError(
+                "`xpu_graphs=True` requires a static (compileable) cache. Set `cache_implementation='static'`."
             )
-        # The backbone is called directly (not via .generate()), so return a wrapper for it.
-        return XPUGraphCapturedForward(self.backbone_model.forward, "CsmBackbone", pool=pool)
+        # Sampling uses multinomial / RNG, which is not capturable on XPU (the generator's offset
+        # increment is a host-side, non-recorded op). Force greedy decoding for this generation and
+        # for the depth decoder's own inner generate (it has a separate generation_config).
+        for cfg in (getattr(self, "generation_config", None), getattr(self.depth_decoder, "generation_config", None)):
+            if cfg is not None and getattr(cfg, "do_sample", False):
+                logger.warning_once(
+                    "`xpu_graphs=True` on XPU does not support sampling (multinomial/RNG is not capturable); "
+                    "forcing greedy decoding for this generation."
+                )
+                cfg.do_sample = False
+        # Use a dedicated pool for the depth decoder's graphs. The outer CSM decode may itself be
+        # captured (its own _get_xpu_graph_forward creates a pool on self._xpu_graph_pool), and two
+        # concurrently-recording graphs cannot share one mempool ("beginAllocateToPool: already
+        # recording to mempool_id").
+        if not hasattr(self.depth_decoder, "_xpu_graph_pool"):
+            self.depth_decoder._xpu_graph_pool = torch.xpu.graph_pool_handle()
+        pool = self.depth_decoder._xpu_graph_pool
+        inner_depth = self.depth_decoder.model
+        if not isinstance(inner_depth.forward, XPUGraphCapturedForward):
+            inner_depth.forward = XPUGraphCapturedForward(inner_depth.forward, "CsmDepthDecoder", pool=pool)
+        # The backbone is invoked directly by this `_sample`. Return a plain callable that runs the
+        # full backbone+head eager (the base `_get_xpu_graph_forward` would wrap self.__call__ and
+        # capture the outer decode, which is not what we want here — depth dominates the cost).
+        def _backbone_call(*args, **kwargs):
+            return self(*args, **kwargs)
+
+        return _backbone_call
 
     def _sample(
         self,
@@ -222,20 +267,29 @@ class CsmGenerationMixin(GenerationMixin):
         # ============================================
 
         if generation_config.xpu_graphs:
-            # XPU graph capture path: manual torch.xpu.graphs decode-step capture for both CSM
-            # sub-models. Mutually exclusive with torch.compile, requires a static cache.
-            if self._valid_auto_compile_criteria(model_kwargs, generation_config):
-                logger.warning_once(
-                    "Both `xpu_graphs` and auto-compile are enabled; `xpu_graphs` takes precedence "
-                    "and torch.compile is disabled for this generation."
-                )
+            # XPU graph capture path. CSM's decode is dominated by the depth decoder; the outer
+            # backbone forward is left eager so its logits contract is intact. Mutually exclusive
+            # with torch.compile (auto-compile was already force-disabled in _prepare_generation_config).
             model_forward = self._get_xpu_graph_forward(model_kwargs)
+            # Csm specific: the depth decoder would create a FRESH static cache per audio frame
+            # (each `depth_decoder.generate` call below). XPU graphs replay against the capture-time
+            # backing store, so per-frame fresh caches would force a full re-capture of every decode
+            # step for every frame. Instead, allocate ONE depth cache for the whole generation and
+            # `reset()` it per frame (zeroing keeps the tensor objects, so positions restart at 0
+            # with identical semantics to a fresh per-frame cache). The captured graphs then replay
+            # across frames.
+            from ...cache_utils import StaticCache
+
+            depth_cache = StaticCache(
+                config=self.depth_decoder.config, max_cache_len=2 * self.config.num_codebooks
+            )
         else:
             model_forward = (
                 self.get_compiled_call(generation_config.compile_config)
                 if self._valid_auto_compile_criteria(model_kwargs, generation_config)
                 else self.__call__
             )
+            depth_cache = None
 
         # *************** Csm specific ***************
         model_kwargs.update({"output_hidden_states": True})
@@ -302,8 +356,12 @@ class CsmGenerationMixin(GenerationMixin):
             depth_decoder_input_ids = nn.functional.pad(first_codebook_ids, (1, 0), value=0)
             backbone_last_hidden_state = outputs.hidden_states[-1][:, -1, :]
 
+            if depth_cache is not None:
+                depth_cache.reset()
             depth_decoder_outputs = self.depth_decoder.generate(
-                input_ids=depth_decoder_input_ids, backbone_last_hidden_state=backbone_last_hidden_state.clone()
+                input_ids=depth_decoder_input_ids,
+                backbone_last_hidden_state=backbone_last_hidden_state.clone(),
+                **({"past_key_values": depth_cache} if depth_cache is not None else {}),
             )
             codebook_ids = (
                 depth_decoder_outputs

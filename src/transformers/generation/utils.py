@@ -2507,6 +2507,8 @@ class GenerationMixin(ContinuousMixin):
             raise ValueError("`xpu_graphs=True` is not compatible with the model's quantization method.")
         if not hasattr(self, "_xpu_graph_pool"):
             self._xpu_graph_pool = torch.xpu.graph_pool_handle()
+        # By default wrap the model's own forward; models with nested sub-models (e.g. CSM) override
+        # this to wrap their inner per-step forwards instead and return the appropriate decode call.
         return XPUGraphCapturedForward(self.__call__, self.__class__.__name__, pool=self._xpu_graph_pool)
 
     @contextmanager
